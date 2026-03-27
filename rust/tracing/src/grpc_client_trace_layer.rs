@@ -10,6 +10,8 @@ use tower::{Layer, Service};
 use tracing::{field::Empty, info_span, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::{current_query_id, QUERY_ID_HEADER_KEY};
+
 const TRACE_ID_HEADER_KEY: &str = "chroma-traceid";
 const SPAN_ID_HEADER_KEY: &str = "chroma-spanid";
 
@@ -51,6 +53,7 @@ where
     fn call(&mut self, mut req: http::Request<ReqBody>) -> Self::Future {
         let span = info_span!(
             "grpc_request",
+            query_id = Empty,
             otel.name = format!("Request {}", req.uri().path()),
             rpc.method = ?req.uri().path(),
             rpc.headers = ?req.headers(),
@@ -68,6 +71,13 @@ where
             HeaderValue::from_str(&span.context().span().span_context().span_id().to_string())
         {
             req.headers_mut().insert(SPAN_ID_HEADER_KEY, header);
+        }
+
+        if let Some(query_id) = current_query_id() {
+            span.record("query_id", query_id.as_str());
+            if let Ok(header) = HeaderValue::from_str(&query_id) {
+                req.headers_mut().insert(QUERY_ID_HEADER_KEY, header);
+            }
         }
 
         let fut = self.inner.call(req);

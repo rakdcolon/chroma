@@ -20,9 +20,12 @@ use chroma_types::{
         self,
         query_executor_server::{QueryExecutor, QueryExecutorServer},
     },
-    operator::{GetResult, Knn, KnnBatch, KnnBatchResult, KnnProjection, QueryVector, Scan},
+    operator::{
+        GetResult, Knn, KnnBatch, KnnBatchResult, KnnProjection, KnnProjectionOutput, QueryVector,
+        Scan,
+    },
     plan::{ReadLevel, SearchPayload},
-    CollectionAndSegments, CollectionUuid, SegmentType,
+    CollectionAndSegments, CollectionUuid, SegmentType, SignedRoaringBitmap,
 };
 use futures::{stream, StreamExt, TryStreamExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -55,6 +58,17 @@ impl ChromaError for InvalidCollectionUuidError {
     fn code(&self) -> chroma_error::ErrorCodes {
         chroma_error::ErrorCodes::InvalidArgument
     }
+}
+
+fn summarize_signed_roaring_bitmap(bitmap: &SignedRoaringBitmap) -> (&'static str, u64) {
+    match bitmap {
+        SignedRoaringBitmap::Include(values) => ("include", values.len()),
+        SignedRoaringBitmap::Exclude(values) => ("exclude", values.len()),
+    }
+}
+
+fn knn_result_counts(results: &[KnnProjectionOutput]) -> Vec<usize> {
+    results.iter().map(|result| result.records.len()).collect()
 }
 
 #[derive(Clone)]
@@ -318,6 +332,15 @@ impl WorkerServer {
         let collection_id = collection_and_segments.collection.collection_id;
         let fetch_log = self.fetch_log(&collection_and_segments, self.fetch_log_batch_size)?;
 
+        tracing::info!(
+            collection_id = %collection_id,
+            vector_segment_type = ?collection_and_segments.vector_segment.r#type,
+            collection_dimension = ?collection_and_segments.collection.dimension,
+            collection_log_position = collection_and_segments.collection.log_position,
+            read_level = ?read_level,
+            "starting count orchestration"
+        );
+
         let count_orchestrator = CountOrchestrator::new(
             self.blockfile_provider.clone(),
             self.clone_dispatcher()?,
@@ -330,11 +353,26 @@ impl WorkerServer {
         );
 
         match count_orchestrator.run(self.system.clone()).await {
-            Ok((count, pulled_log_bytes)) => Ok(Response::new(chroma_proto::CountResult {
-                count,
-                pulled_log_bytes,
-            })),
-            Err(err) => Err(Status::new(err.code().into(), err.to_string())),
+            Ok((count, pulled_log_bytes)) => {
+                tracing::info!(
+                    collection_id = %collection_id,
+                    count,
+                    pulled_log_bytes,
+                    "count orchestration completed"
+                );
+                Ok(Response::new(chroma_proto::CountResult {
+                    count,
+                    pulled_log_bytes,
+                }))
+            }
+            Err(err) => {
+                tracing::info!(
+                    collection_id = %collection_id,
+                    error = %err,
+                    "count orchestration failed"
+                );
+                Err(Status::new(err.code().into(), err.to_string()))
+            }
         }
     }
 
@@ -423,14 +461,37 @@ impl WorkerServer {
             .ok_or(Status::invalid_argument("Invalid Projection Operator"))?;
         let knn_projection = KnnProjection::try_from(projection)
             .map_err(|e| Status::invalid_argument(format!("Invalid Projection Operator: {}", e)))?;
+        let filter: chroma_types::operator::Filter = filter.try_into()?;
+
+        tracing::info!(
+            collection_id = %collection_id,
+            vector_segment_type = ?collection_and_segments.vector_segment.r#type,
+            collection_dimension = ?collection_and_segments.collection.dimension,
+            collection_log_position = collection_and_segments.collection.log_position,
+            num_embeddings = knn.embeddings.len(),
+            fetch = knn.fetch,
+            num_query_ids = filter.query_ids.as_ref().map_or(0, Vec::len),
+            has_where = filter.where_clause.is_some(),
+            include_document = knn_projection.projection.document,
+            include_embedding = knn_projection.projection.embedding,
+            include_metadata = knn_projection.projection.metadata,
+            include_distance = knn_projection.distance,
+            "starting knn query orchestration"
+        );
 
         if knn.embeddings.is_empty() {
+            tracing::info!(collection_id = %collection_id, "knn request had no embeddings");
             return Ok(Response::new(KnnBatchResult::default().try_into()?));
         }
 
         // We return early on uninitialized collection, otherwise
         // the downstream will error due to missing dimension
         if collection_and_segments.is_uninitialized() {
+            tracing::info!(
+                collection_id = %collection_id,
+                num_embeddings = knn.embeddings.len(),
+                "collection is uninitialized; returning empty knn results"
+            );
             return Ok(Response::new(
                 KnnBatchResult {
                     pulled_log_bytes: 0,
@@ -450,7 +511,7 @@ impl WorkerServer {
             1000,
             collection_and_segments.clone(),
             fetch_log,
-            filter.try_into()?,
+            filter,
             ReadLevel::IndexAndWal, // Full consistency for KNN queries
             bloom_filter_manager.clone(),
         );
@@ -458,11 +519,29 @@ impl WorkerServer {
         let matching_records = match knn_filter_orchestrator.run(system.clone()).await {
             Ok(output) => output,
             Err(e) => {
+                tracing::info!(collection_id = %collection_id, error = %e, "knn filter failed");
                 return Err(Status::new(e.code().into(), e.to_string()));
             }
         };
 
         let pulled_log_bytes = matching_records.fetch_log_bytes;
+        let (log_offset_kind, log_offset_count) =
+            summarize_signed_roaring_bitmap(&matching_records.filter_output.log_offset_ids);
+        let (compact_offset_kind, compact_offset_count) =
+            summarize_signed_roaring_bitmap(&matching_records.filter_output.compact_offset_ids);
+
+        tracing::info!(
+            collection_id = %collection_id,
+            pulled_log_bytes,
+            dimension = matching_records.dimension,
+            distance_function = ?matching_records.distance_function,
+            has_hnsw_reader = matching_records.hnsw_reader.is_some(),
+            log_offset_mode = log_offset_kind,
+            log_offset_count,
+            compact_offset_mode = compact_offset_kind,
+            compact_offset_count,
+            "knn filter completed"
+        );
 
         if matches!(
             vector_segment_type,
@@ -470,8 +549,10 @@ impl WorkerServer {
         ) {
             tracing::debug!("Running KNN on SPANN segment");
             // Create unified futures that run KNN then projection
-            let knn_with_projection_futures =
-                Vec::from(KnnBatch::try_from(knn)?).into_iter().map(|knn| {
+            let knn_with_projection_futures = Vec::from(KnnBatch::try_from(knn)?)
+                .into_iter()
+                .enumerate()
+                .map(|(query_index, knn)| {
                     let spann_provider = self.spann_provider.clone();
                     let dispatcher = dispatcher.clone();
                     let collection_and_segments = collection_and_segments.clone();
@@ -483,6 +564,12 @@ impl WorkerServer {
                     let bloom_filter_manager = bloom_filter_manager.clone();
 
                     async move {
+                        tracing::info!(
+                            query_index,
+                            segment_type = ?segment_type,
+                            requested_fetch = knn.fetch,
+                            "running knn candidate generation"
+                        );
                         // Run KNN orchestrator — dispatch based on segment type.
                         let record_distances = match segment_type {
                             SegmentType::QuantizedSpann => QuantizedSpannKnnOrchestrator::new(
@@ -512,6 +599,12 @@ impl WorkerServer {
                             .map_err(|e| Status::new(e.code().into(), e.to_string()))?,
                         };
 
+                        tracing::info!(
+                            query_index,
+                            candidate_count = record_distances.len(),
+                            "knn candidate generation completed"
+                        );
+
                         // Run projection orchestrator
                         let projection_orchestrator = ProjectionOrchestrator::new(
                             dispatcher,
@@ -523,10 +616,16 @@ impl WorkerServer {
                             knn_projection,
                             bloom_filter_manager,
                         );
-                        projection_orchestrator
+                        let projection_output = projection_orchestrator
                             .run(system)
                             .await
-                            .map_err(|e| Status::new(e.code().into(), e.to_string()))
+                            .map_err(|e| Status::new(e.code().into(), e.to_string()))?;
+                        tracing::info!(
+                            query_index,
+                            returned_records = projection_output.records.len(),
+                            "projection completed"
+                        );
+                        Ok(projection_output)
                     }
                 });
 
@@ -535,19 +634,36 @@ impl WorkerServer {
                 .try_collect::<Vec<_>>()
                 .await
             {
-                Ok(results) => Ok(Response::new(
-                    KnnBatchResult {
+                Ok(results) => {
+                    tracing::info!(
+                        collection_id = %collection_id,
                         pulled_log_bytes,
-                        results,
-                    }
-                    .try_into()?,
-                )),
-                Err(err) => Err(err),
+                        result_counts = ?knn_result_counts(&results),
+                        "knn query orchestration completed"
+                    );
+                    Ok(Response::new(
+                        KnnBatchResult {
+                            pulled_log_bytes,
+                            results,
+                        }
+                        .try_into()?,
+                    ))
+                }
+                Err(err) => {
+                    tracing::info!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "knn query orchestration failed during candidate generation or projection"
+                    );
+                    Err(err)
+                }
             }
         } else {
             // Create unified futures that run KNN then projection
-            let knn_with_projection_futures =
-                Vec::from(KnnBatch::try_from(knn)?).into_iter().map(|knn| {
+            let knn_with_projection_futures = Vec::from(KnnBatch::try_from(knn)?)
+                .into_iter()
+                .enumerate()
+                .map(|(query_index, knn)| {
                     let blockfile_provider = self.blockfile_provider.clone();
                     let dispatcher = dispatcher.clone();
                     let collection_and_segments = collection_and_segments.clone();
@@ -557,6 +673,11 @@ impl WorkerServer {
                     let bloom_filter_manager = bloom_filter_manager.clone();
 
                     async move {
+                        tracing::info!(
+                            query_index,
+                            requested_fetch = knn.fetch,
+                            "running knn candidate generation"
+                        );
                         // Run KNN orchestrator
                         let knn_orchestrator = KnnOrchestrator::new(
                             blockfile_provider.clone(),
@@ -573,6 +694,12 @@ impl WorkerServer {
                             .await
                             .map_err(|e| Status::new(e.code().into(), e.to_string()))?;
 
+                        tracing::info!(
+                            query_index,
+                            candidate_count = record_distances.len(),
+                            "knn candidate generation completed"
+                        );
+
                         // Run projection orchestrator
                         let projection_orchestrator = ProjectionOrchestrator::new(
                             dispatcher,
@@ -584,10 +711,16 @@ impl WorkerServer {
                             knn_projection,
                             bloom_filter_manager,
                         );
-                        projection_orchestrator
+                        let projection_output = projection_orchestrator
                             .run(system)
                             .await
-                            .map_err(|e| Status::new(e.code().into(), e.to_string()))
+                            .map_err(|e| Status::new(e.code().into(), e.to_string()))?;
+                        tracing::info!(
+                            query_index,
+                            returned_records = projection_output.records.len(),
+                            "projection completed"
+                        );
+                        Ok(projection_output)
                     }
                 });
 
@@ -596,14 +729,29 @@ impl WorkerServer {
                 .try_collect::<Vec<_>>()
                 .await
             {
-                Ok(results) => Ok(Response::new(
-                    KnnBatchResult {
+                Ok(results) => {
+                    tracing::info!(
+                        collection_id = %collection_id,
                         pulled_log_bytes,
-                        results,
-                    }
-                    .try_into()?,
-                )),
-                Err(err) => Err(err),
+                        result_counts = ?knn_result_counts(&results),
+                        "knn query orchestration completed"
+                    );
+                    Ok(Response::new(
+                        KnnBatchResult {
+                            pulled_log_bytes,
+                            results,
+                        }
+                        .try_into()?,
+                    ))
+                }
+                Err(err) => {
+                    tracing::info!(
+                        collection_id = %collection_id,
+                        error = %err,
+                        "knn query orchestration failed during candidate generation or projection"
+                    );
+                    Err(err)
+                }
             }
         }
     }

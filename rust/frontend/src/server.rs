@@ -45,6 +45,7 @@ use tokio::signal::unix::{signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::ctrl_c;
 use tower_http::cors::CorsLayer;
+use tracing::Instrument;
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::ToSchema;
 use utoipa::{Modify, OpenApi};
@@ -78,6 +79,10 @@ impl chroma_error::ChromaError for RateLimitError {
 pub struct ForkCountResponse {
     /// The number of forks for this collection.
     pub count: usize,
+}
+
+fn query_result_counts(response: &QueryResponse) -> Vec<usize> {
+    response.ids.iter().map(Vec::len).collect()
 }
 
 async fn graceful_shutdown(system: System) {
@@ -2433,13 +2438,8 @@ async fn collection_count(
     Query(CountParams { read_level }): Query<CountParams>,
     State(mut server): State<FrontendServer>,
 ) -> Result<Json<CountResponse>, ServerError> {
+    let query_id = Uuid::new_v4();
     server.metrics.collection_count.add(1, &[]);
-    tracing::info!(
-        name: "collection_count",
-        tenant = tenant,
-        database = database,
-        collection_id = collection_id
-    );
     let requester_identity = server
         .authenticate_and_authorize_collection(
             &headers,
@@ -2485,6 +2485,18 @@ async fn collection_count(
         )
     };
 
+    let tenant_for_span = tenant.clone();
+    let database_for_span = database.clone();
+    let collection_id_for_span = collection_id.clone();
+    let count_span = tracing::info_span!(
+        "collection_count",
+        query_id = %query_id,
+        tenant = %tenant_for_span,
+        database = %database_for_span,
+        collection_id = %collection_id_for_span,
+        read_level = ?read_level,
+    );
+
     let request = CountRequest::try_new(
         tenant,
         database,
@@ -2492,13 +2504,23 @@ async fn collection_count(
         read_level,
     )?;
 
-    Ok(Json(
-        server
-            .frontend
-            .count(request)
-            .meter(metering_context_container)
-            .await?,
-    ))
+    tracing::info!(parent: &count_span, "dispatching collection count");
+
+    let res = chroma_tracing::with_query_id(
+        query_id.to_string(),
+        Box::pin(
+            server
+                .frontend
+                .count(request)
+                .meter(metering_context_container),
+        )
+        .instrument(count_span.clone()),
+    )
+    .await?;
+
+    tracing::info!(parent: &count_span, count = res, "collection count completed");
+
+    Ok(Json(res))
 }
 
 /// Get indexing status
@@ -2862,6 +2884,7 @@ async fn collection_query(
     State(mut server): State<FrontendServer>,
     TracedJson(payload): TracedJson<QueryRequestPayload>,
 ) -> Result<Json<QueryResponse>, ServerError> {
+    let query_id = Uuid::new_v4();
     server.metrics.collection_query.add(1, &[]);
     let requester_identity = server
         .authenticate_and_authorize_collection(
@@ -2936,12 +2959,25 @@ async fn collection_query(
         context.start_request(Instant::now());
     });
 
-    tracing::info!(
-        name: "collection_query",
-        num_ids = payload.ids.as_ref().map_or(0, |ids| ids.len()),
-        num_embeddings = payload.query_embeddings.len(),
-        include = ?payload.include,
-        has_where = parsed_where.is_some(),
+    let num_ids = payload.ids.as_ref().map_or(0, |ids| ids.len());
+    let num_embeddings = payload.query_embeddings.len();
+    let n_results = payload.n_results.unwrap_or(10);
+    let include = payload.include.clone();
+    let has_where = parsed_where.is_some();
+    let tenant_for_span = tenant.clone();
+    let database_for_span = database.clone();
+    let collection_id_for_span = collection_id.to_string();
+    let query_span = tracing::info_span!(
+        "collection_query",
+        query_id = %query_id,
+        tenant = %tenant_for_span,
+        database = %database_for_span,
+        collection_id = %collection_id_for_span,
+        num_ids,
+        num_embeddings,
+        n_results,
+        include = ?include,
+        has_where,
     );
     let request = QueryRequest::try_new(
         tenant,
@@ -2950,19 +2986,31 @@ async fn collection_query(
         payload.ids,
         parsed_where,
         payload.query_embeddings,
-        payload.n_results.unwrap_or(10),
+        n_results,
         payload.include,
     )?;
 
+    tracing::info!(parent: &query_span, "dispatching collection query");
+
     // pin the request since future exceeds size limit (16KB)
     // Box::pin is required to avoid stack overflow by moving future to heap
-    let res = Box::pin(
-        server
-            .frontend
-            .query(request)
-            .meter(metering_context_container),
+    let res = chroma_tracing::with_query_id(
+        query_id.to_string(),
+        Box::pin(
+            server
+                .frontend
+                .query(request)
+                .meter(metering_context_container),
+        )
+        .instrument(query_span.clone()),
     )
     .await?;
+
+    tracing::info!(
+        parent: &query_span,
+        result_counts = ?query_result_counts(&res),
+        "collection query completed"
+    );
 
     Ok(Json(res))
 }

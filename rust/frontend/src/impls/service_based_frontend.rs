@@ -1443,6 +1443,14 @@ impl ServiceBasedFrontend {
             .get_collection_with_segments(Some(database_name_typed), collection_id)
             .await
             .map_err(|err| Box::new(err) as Box<dyn ChromaError>)?;
+        tracing::info!(
+            collection_id = %collection_id,
+            vector_segment_type = ?collection_and_segments.vector_segment.r#type,
+            collection_dimension = ?collection_and_segments.collection.dimension,
+            collection_log_position = collection_and_segments.collection.log_position,
+            read_level = ?read_level,
+            "resolved collection and segments for count"
+        );
         let latest_collection_logical_size_bytes = collection_and_segments
             .collection
             .size_bytes_post_compaction;
@@ -1455,6 +1463,13 @@ impl ServiceBasedFrontend {
                 read_level,
             })
             .await?;
+        tracing::info!(
+            collection_id = %collection_id,
+            count = count_result.count,
+            pulled_log_bytes = count_result.pulled_log_bytes,
+            latest_collection_logical_size_bytes,
+            "count executor completed"
+        );
         let return_bytes = count_result.size_bytes();
 
         // Attach metadata to the metering context
@@ -1766,6 +1781,17 @@ impl ServiceBasedFrontend {
             .get_collection_with_segments(Some(database_name_typed), collection_id)
             .await
             .map_err(|err| Box::new(err) as Box<dyn ChromaError>)?;
+        tracing::info!(
+            collection_id = %collection_id,
+            vector_segment_type = ?collection_and_segments.vector_segment.r#type,
+            collection_dimension = ?collection_and_segments.collection.dimension,
+            collection_log_position = collection_and_segments.collection.log_position,
+            num_embeddings = embeddings.len(),
+            num_ids = ids.as_ref().map_or(0, Vec::len),
+            n_results,
+            has_where = r#where.is_some(),
+            "resolved collection and segments for query"
+        );
         if self.enable_schema {
             if let Some(ref schema) = collection_and_segments.collection.schema {
                 if let Some(ref where_clause) = r#where {
@@ -1813,6 +1839,17 @@ impl ServiceBasedFrontend {
                 },
             })
             .await?;
+        tracing::info!(
+            collection_id = %collection_id,
+            pulled_log_bytes = query_result.pulled_log_bytes,
+            result_counts = ?query_result
+                .results
+                .iter()
+                .map(|result| result.records.len())
+                .collect::<Vec<_>>(),
+            latest_collection_logical_size_bytes,
+            "query executor completed"
+        );
         let return_bytes = query_result.size_bytes();
 
         // Attach metadata to the metering context

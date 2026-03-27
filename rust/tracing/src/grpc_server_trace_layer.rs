@@ -4,6 +4,8 @@ use tracing::instrument::Instrumented;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::QUERY_ID_HEADER_KEY;
+
 const TRACE_ID_HEADER_KEY: &str = "chroma-traceid";
 const SPAN_ID_HEADER_KEY: &str = "chroma-spanid";
 
@@ -40,6 +42,7 @@ where
     fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
         let span = tracing::trace_span!(
             "gRPC request",
+            query_id = tracing::field::Empty,
             otel.name = format!("Request {}", req.uri().path())
         );
 
@@ -54,6 +57,14 @@ where
             .get(SPAN_ID_HEADER_KEY)
             .and_then(|h| h.to_str().ok())
             .and_then(|id| SpanId::from_hex(id).ok());
+
+        if let Some(query_id) = req
+            .headers()
+            .get(QUERY_ID_HEADER_KEY)
+            .and_then(|h| h.to_str().ok())
+        {
+            span.record("query_id", query_id);
+        }
 
         if let Some(trace_id) = trace_id {
             if let Some(span_id) = span_id {

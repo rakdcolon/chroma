@@ -136,6 +136,13 @@ impl DistributedExecutor {
             .client_assigner
             .clients(&collection.collection_id.to_string(), tier)
             .map_err(|e| ExecutorError::Internal(e.boxed()))?;
+        tracing::info!(
+            collection_id = %collection.collection_id,
+            tier = tier.0,
+            read_level = ?plan.read_level,
+            candidate_query_nodes = clients.len(),
+            "dispatching distributed count query"
+        );
         let plan: chroma_types::chroma_proto::CountPlan = plan.clone().try_into()?;
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let config = self.client_selection_config.clone();
@@ -153,7 +160,14 @@ impl DistributedExecutor {
             .when(is_retryable_error)
             .await?
         };
-        Ok(res.into_inner().into())
+        let res: CountResult = res.into_inner().into();
+        tracing::info!(
+            collection_id = %collection.collection_id,
+            count = res.count,
+            pulled_log_bytes = res.pulled_log_bytes,
+            "distributed count query completed"
+        );
+        Ok(res)
     }
 
     pub async fn get(&mut self, plan: Get) -> Result<GetResult, ExecutorError> {
@@ -189,6 +203,16 @@ impl DistributedExecutor {
             .client_assigner
             .clients(&collection.collection_id.to_string(), tier)
             .map_err(|e| ExecutorError::Internal(e.boxed()))?;
+        tracing::info!(
+            collection_id = %collection.collection_id,
+            tier = tier.0,
+            num_embeddings = plan.knn.embeddings.len(),
+            fetch = plan.knn.fetch,
+            num_query_ids = plan.filter.query_ids.as_ref().map_or(0, Vec::len),
+            has_where = plan.filter.where_clause.is_some(),
+            candidate_query_nodes = clients.len(),
+            "dispatching distributed knn query"
+        );
         let attempt_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let config = self.client_selection_config.clone();
         let res = {
@@ -205,7 +229,18 @@ impl DistributedExecutor {
             .when(is_retryable_error)
             .await?
         };
-        Ok(res.into_inner().try_into()?)
+        let res: KnnBatchResult = res.into_inner().try_into()?;
+        tracing::info!(
+            collection_id = %collection.collection_id,
+            pulled_log_bytes = res.pulled_log_bytes,
+            result_counts = ?res
+                .results
+                .iter()
+                .map(|result| result.records.len())
+                .collect::<Vec<_>>(),
+            "distributed knn query completed"
+        );
+        Ok(res)
     }
 
     pub async fn search(&mut self, plan: Search) -> Result<SearchResult, ExecutorError> {
