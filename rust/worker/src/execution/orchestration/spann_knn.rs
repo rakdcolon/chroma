@@ -210,6 +210,13 @@ impl Orchestrator for SpannKnnOrchestrator {
                     self.heads_searched = true;
                 }
                 _ => {
+                    tracing::error!(
+                        collection_id = %self.collection_and_segments.collection.collection_id,
+                        vector_segment_id = %self.collection_and_segments.vector_segment.id,
+                        vector_segment_files = ?self.collection_and_segments.vector_segment.file_path,
+                        error = ?e,
+                        "Failed to create SPANN segment reader"
+                    );
                     let _: Option<()> = self
                         .ok_or_terminate(Err(KnnError::SpannSegmentReaderCreationError(e)), ctx)
                         .await;
@@ -272,6 +279,25 @@ impl Handler<TaskResult<SpannCentersSearchOutput, SpannCentersSearchError>>
         self.num_outstanding_bf_pl = output.center_ids.len();
         // Spawn fetch posting list tasks for the centers.
         for head_id in output.center_ids {
+            let fetch_pl_span = match self.spann_reader.as_ref() {
+                Some(reader) => tracing::info_span!(
+                    parent: Span::current(),
+                    "Fetch spann posting list",
+                    collection_id = %reader.collection_id(),
+                    vector_segment_id = %reader.segment_id(),
+                    head_id = head_id as u32,
+                    posting_list_blockfile_id = %reader.posting_list_blockfile_id(),
+                    versions_map_blockfile_id = %reader.versions_map_blockfile_id(),
+                    prefix_path = reader.prefix_path(),
+                ),
+                None => tracing::info_span!(
+                    parent: Span::current(),
+                    "Fetch spann posting list",
+                    collection_id = %self.collection_and_segments.collection.collection_id,
+                    vector_segment_id = %self.collection_and_segments.vector_segment.id,
+                    head_id = head_id as u32,
+                ),
+            };
             // Invoke Head search operator.
             let fetch_pl_task = wrap(
                 Box::new(self.fetch_pl.clone()),
@@ -283,7 +309,7 @@ impl Handler<TaskResult<SpannCentersSearchOutput, SpannCentersSearchError>>
                 self.context.task_cancellation_token.clone(),
             );
 
-            self.send(fetch_pl_task, ctx, Some(Span::current())).await;
+            self.send(fetch_pl_task, ctx, Some(fetch_pl_span)).await;
         }
     }
 }

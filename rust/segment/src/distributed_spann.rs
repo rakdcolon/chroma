@@ -16,6 +16,7 @@ use chroma_index::IndexUuid;
 use chroma_index::{hnsw_provider::HnswIndexProvider, spann::types::SpannIndexWriter};
 use chroma_types::Cmek;
 use chroma_types::Collection;
+use chroma_types::CollectionUuid;
 use chroma_types::Schema;
 use chroma_types::SchemaError;
 use chroma_types::SegmentUuid;
@@ -28,6 +29,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct SpannSegmentWriter {
@@ -433,8 +435,12 @@ pub enum SpannSegmentReaderError {
     SpannSegmentReaderCreateError(#[source] SpannIndexReaderError),
     #[error("Spann segment is uninitialized")]
     UninitializedSegment,
-    #[error("Error fetching posting list for key {0}")]
-    KeyReadError(#[source] SpannIndexReaderError),
+    #[error("Error fetching posting list for head_id {head_id}: {source}")]
+    KeyReadError {
+        head_id: u32,
+        #[source]
+        source: SpannIndexReaderError,
+    },
     #[error("Error performing rng query {0}")]
     RngError(#[source] SpannIndexReaderError),
     #[error("Prefix paths do not match")]
@@ -453,7 +459,7 @@ impl ChromaError for SpannSegmentReaderError {
             Self::PostingListInvalidFilePath => ErrorCodes::Internal,
             Self::SpannSegmentReaderCreateError(e) => e.code(),
             Self::UninitializedSegment => ErrorCodes::Internal,
-            Self::KeyReadError(e) => e.code(),
+            Self::KeyReadError { source, .. } => source.code(),
             Self::MissingSpannConfiguration => ErrorCodes::Internal,
             Self::RngError(e) => e.code(),
             Self::InvalidPrefixPath => ErrorCodes::Internal,
@@ -465,7 +471,7 @@ impl ChromaError for SpannSegmentReaderError {
 #[derive(Clone, Debug)]
 pub struct SpannSegmentReader<'me> {
     pub index_reader: SpannIndexReader<'me>,
-    #[allow(dead_code)]
+    collection_id: CollectionUuid,
     id: SegmentUuid,
 }
 
@@ -574,8 +580,29 @@ impl<'me> SpannSegmentReader<'me> {
 
         Ok(SpannSegmentReader {
             index_reader,
+            collection_id: segment.collection,
             id: segment.id,
         })
+    }
+
+    pub fn collection_id(&self) -> CollectionUuid {
+        self.collection_id
+    }
+
+    pub fn segment_id(&self) -> SegmentUuid {
+        self.id
+    }
+
+    pub fn prefix_path(&self) -> &str {
+        &self.index_reader.prefix_path
+    }
+
+    pub fn posting_list_blockfile_id(&self) -> Uuid {
+        self.index_reader.posting_list_blockfile_id
+    }
+
+    pub fn versions_map_blockfile_id(&self) -> Uuid {
+        self.index_reader.versions_map_blockfile_id
     }
 
     pub async fn fetch_posting_list(
@@ -586,8 +613,18 @@ impl<'me> SpannSegmentReader<'me> {
             .fetch_posting_list(head_id)
             .await
             .map_err(|e| {
-                tracing::error!("Error fetching posting list for head {}:{:?}", head_id, e);
-                SpannSegmentReaderError::KeyReadError(e)
+                tracing::error!(
+                    collection_id = %self.collection_id,
+                    segment_id = %self.id,
+                    head_id,
+                    posting_list_blockfile_id = %self.index_reader.posting_list_blockfile_id,
+                    versions_map_blockfile_id = %self.index_reader.versions_map_blockfile_id,
+                    hnsw_index_id = %self.index_reader.hnsw_index_id,
+                    prefix_path = self.index_reader.prefix_path.as_str(),
+                    error = ?e,
+                    "Error fetching SPANN posting list"
+                );
+                SpannSegmentReaderError::KeyReadError { head_id, source: e }
             })
     }
 

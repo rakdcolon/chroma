@@ -545,9 +545,18 @@ impl BlockManager {
                     let bytes = match bytes {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            tracing::error!("Error loading block from storage: {:?}", e);
+                            tracing::error!(
+                                block_id = %id_clone,
+                                block_key = %key_clone,
+                                disk_only,
+                                error = ?e,
+                                "Error loading block from storage"
+                            );
                             return Err(StorageError::Message {
-                                message: "Error loading block".to_string(),
+                                message: format!(
+                                    "Error loading block block_id={} block_key={} disk_only={}: {}",
+                                    id_clone, key_clone, disk_only, e
+                                ),
                             });
                         }
                     };
@@ -571,15 +580,20 @@ impl BlockManager {
                         }
                         Err(e) => {
                             tracing::error!(
-                                "Error converting bytes to Block {:?}/{:?}",
-                                key_clone,
-                                e
+                                block_id = %id_clone,
+                                block_key = %key_clone,
+                                disk_only,
+                                error = ?e,
+                                "Error converting storage bytes to block"
                             );
                             // TODO(hammadb): We should ideally use BlockLoadError here since that is what this level of the code expects,
                             // however that type is not trivially Clone. Since for all practical purposes this error results in the same upstream handling
                             // and observability properties we use a generic StorageError here.
                             Err(StorageError::Message {
-                                message: "Error converting bytes to Block".to_string(),
+                                message: format!(
+                                    "Error converting block bytes block_id={} block_key={} disk_only={}: {}",
+                                    id_clone, key_clone, disk_only, e
+                                ),
                             })
                         }
                     }
@@ -590,7 +604,13 @@ impl BlockManager {
         match res {
             Ok(block) => Ok(Some(block.0)),
             Err(e) => {
-                tracing::error!("Error fetching block from storage: {:?}", e);
+                tracing::error!(
+                    block_id = %id,
+                    block_key = %key,
+                    disk_only,
+                    error = ?e,
+                    "Error fetching block from storage"
+                );
                 Err(GetError::StorageGetError(e))
             }
         }

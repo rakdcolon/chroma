@@ -2608,7 +2608,7 @@ pub enum SpannIndexReaderError {
     HnswIndexConstructionError(#[source] HnswIndexProviderOpenError),
     #[error("Error creating/opening postings list reader {0}")]
     PostingListReaderConstructionError(#[source] OpenError),
-    #[error("Error creating/opening versions map reader")]
+    #[error("Error creating/opening versions map reader {0}")]
     VersionsMapReaderConstructionError(#[source] OpenError),
     #[error("Spann index uninitialized")]
     UninitializedIndex,
@@ -2657,6 +2657,10 @@ pub struct SpannIndexReader<'me> {
     pub posting_lists: BlockfileReader<'me, u32, SpannPostingList<'me>>,
     pub hnsw_index: HnswIndexRef,
     pub versions_map: BlockfileReader<'me, u32, u32>,
+    pub hnsw_index_id: IndexUuid,
+    pub posting_list_blockfile_id: Uuid,
+    pub versions_map_blockfile_id: Uuid,
+    pub prefix_path: String,
     pub dimensionality: usize,
     pub adaptive_search_nprobe: bool,
     pub params: InternalSpannConfiguration,
@@ -2743,6 +2747,12 @@ impl<'me> SpannIndexReader<'me> {
         adaptive_search_nprobe: bool,
         params: InternalSpannConfiguration,
     ) -> Result<SpannIndexReader<'me>, SpannIndexReaderError> {
+        let hnsw_index_id = match hnsw_id {
+            Some(hnsw_id) => *hnsw_id,
+            None => {
+                return Err(SpannIndexReaderError::UninitializedIndex);
+            }
+        };
         let hnsw_reader = match hnsw_id {
             Some(hnsw_id) => {
                 Self::hnsw_index_from_id(
@@ -2761,30 +2771,34 @@ impl<'me> SpannIndexReader<'me> {
             }
         };
 
-        let (postings_list_reader, versions_map_reader) =
-            match (pl_blockfile_id, versions_map_blockfile_id) {
-                (Some(pl_id), Some(versions_id)) => {
-                    let (pl_result, vm_result) = tokio::join!(
-                        Self::posting_list_reader_from_id(pl_id, blockfile_provider, prefix_path)
-                            .instrument(Span::current()),
-                        Self::versions_map_reader_from_id(
-                            versions_id,
-                            blockfile_provider,
-                            prefix_path
-                        )
+        let (
+            postings_list_reader,
+            versions_map_reader,
+            posting_list_blockfile_id,
+            versions_map_blockfile_id,
+        ) = match (pl_blockfile_id, versions_map_blockfile_id) {
+            (Some(pl_id), Some(versions_id)) => {
+                let (pl_result, vm_result) = tokio::join!(
+                    Self::posting_list_reader_from_id(pl_id, blockfile_provider, prefix_path)
+                        .instrument(Span::current()),
+                    Self::versions_map_reader_from_id(versions_id, blockfile_provider, prefix_path)
                         .instrument(Span::current())
-                    );
-                    (pl_result?, vm_result?)
-                }
-                (None, _) | (_, None) => {
-                    return Err(SpannIndexReaderError::UninitializedIndex);
-                }
-            };
+                );
+                (pl_result?, vm_result?, *pl_id, *versions_id)
+            }
+            (None, _) | (_, None) => {
+                return Err(SpannIndexReaderError::UninitializedIndex);
+            }
+        };
 
         Ok(Self {
             posting_lists: postings_list_reader,
             hnsw_index: hnsw_reader,
             versions_map: versions_map_reader,
+            hnsw_index_id,
+            posting_list_blockfile_id,
+            versions_map_blockfile_id,
+            prefix_path: prefix_path.to_string(),
             dimensionality,
             adaptive_search_nprobe,
             params,
@@ -2806,9 +2820,11 @@ impl<'me> SpannIndexReader<'me> {
             .await
             .map_err(|e| {
                 tracing::error!(
-                    "Error getting version for doc offset id {}: {}",
                     doc_offset_id,
-                    e
+                    versions_map_blockfile_id = %self.versions_map_blockfile_id,
+                    prefix_path = self.prefix_path.as_str(),
+                    error = %e,
+                    "Error reading SPANN versions map"
                 );
                 SpannIndexReaderError::VersionsMapReadError(e)
             })?
@@ -2867,7 +2883,13 @@ impl<'me> SpannIndexReader<'me> {
             .get("", head_id)
             .await
             .map_err(|e| {
-                tracing::error!("Error getting posting list for head {}: {}", head_id, e);
+                tracing::error!(
+                    head_id,
+                    posting_list_blockfile_id = %self.posting_list_blockfile_id,
+                    prefix_path = self.prefix_path.as_str(),
+                    error = %e,
+                    "Error reading SPANN posting list"
+                );
                 SpannIndexReaderError::PostingListReadError(e)
             })?
             .ok_or(SpannIndexReaderError::PostingListNotFound)?;
@@ -2881,9 +2903,12 @@ impl<'me> SpannIndexReader<'me> {
             future::try_join_all(res.doc_offset_ids.iter().map(|offset_id| async {
                 self.versions_map.get("", *offset_id).await.map_err(|e| {
                     tracing::error!(
-                        "Error getting version for doc offset id {}: {}",
-                        *offset_id,
-                        e
+                        head_id,
+                        doc_offset_id = *offset_id,
+                        versions_map_blockfile_id = %self.versions_map_blockfile_id,
+                        prefix_path = self.prefix_path.as_str(),
+                        error = %e,
+                        "Error reading SPANN versions map"
                     );
                     SpannIndexReaderError::VersionsMapReadError(e)
                 })
@@ -2959,9 +2984,11 @@ impl<'me> SpannIndexReader<'me> {
                             .await
                             .map_err(|e| {
                                 tracing::error!(
-                                    "Error getting version for doc offset id {}: {}",
-                                    doc_offset_id,
-                                    e
+                                    doc_offset_id = *doc_offset_id,
+                                    versions_map_blockfile_id = %self.versions_map_blockfile_id,
+                                    prefix_path = self.prefix_path.as_str(),
+                                    error = %e,
+                                    "Error reading SPANN versions map"
                                 );
                                 SpannIndexReaderError::VersionsMapReadError(e)
                             })?
