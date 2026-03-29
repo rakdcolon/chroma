@@ -112,7 +112,9 @@ impl S3StorageConfig {
     }
 
     fn default_read_timeout_ms() -> u64 {
-        2000
+        // Set to 1/4 the request timeout, so you get three full timeouts before the request it
+        // self times out.
+        15000
     }
 
     fn default_request_timeout_ms() -> u64 {
